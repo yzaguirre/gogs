@@ -18,11 +18,89 @@ import (
 
 	"github.com/gogits/gogs/modules/log"
 	"github.com/gogits/gogs/modules/setting"
+
+	"golang.org/x/crypto/openpgp"
+	"encoding/base64"
+	"io/ioutil"
 )
 
 type Message struct {
 	Info string // Message information for log purpose.
 	*gomail.Message
+}
+
+func encBody(secretString string, to []string) (string, error) {
+
+	// Read in public key
+	keyringFileBuffer, _ := os.Open(setting.MailService.PublicKeyring)
+	defer keyringFileBuffer.Close()
+	completeEntityList, err := openpgp.ReadKeyRing(keyringFileBuffer)
+	if err != nil {
+		return "", err
+	}
+	// Find the pubilc keys that matches emails in "to"
+	var encEntityList openpgp.EntityList
+	for _, email := range to {
+		EncLoop: for _, entity := range completeEntityList {
+			for _, identity := range entity.Identities { // normally only one identity per entity
+				if email == identity.UserId.Email {
+					encEntityList = append(encEntityList, entity)
+					break EncLoop
+				}
+			}
+		}
+	}
+	// Read in private key
+	var secretKeyringFileBuffer, _ = os.Open(setting.MailService.SecretKeyring)
+	defer secretKeyringFileBuffer.Close()
+	secretEntityList, err := openpgp.ReadKeyRing(secretKeyringFileBuffer)
+	if err != nil {
+		return "", err
+	}
+	// decrypt private signing key
+	var signEmail string = setting.MailService.From
+	var signEntity *openpgp.Entity
+	SignLoop: for _, entity := range secretEntityList {
+		for _, identity := range entity.Identities { // normally only one identity
+			if signEmail == identity.UserId.Email {
+				//log.Println("sign email is a match", identity.UserId.Email)
+				signEntity = entity
+				break SignLoop
+			}
+		}
+	}
+	// Get the passphrase and read the decrypted private signing key.
+	passphraseByte := []byte(setting.MailService.KeyPassphrase)
+	signEntity.PrivateKey.Decrypt(passphraseByte)
+	for _, subkey := range signEntity.Subkeys {
+		subkey.PrivateKey.Decrypt(passphraseByte)
+	}
+
+	// encrypt and sign mySecretString
+	buf := new(bytes.Buffer)
+	w, err := openpgp.Encrypt(buf, encEntityList, signEntity, nil, nil)
+	if err != nil {
+		return "", err
+	}
+	_, err = w.Write([]byte(secretString))
+	if err != nil {
+		return "", err
+	}
+	err = w.Close()
+	if err != nil {
+		return "", err
+	}
+
+	// Encode to base64
+	bytes, err := ioutil.ReadAll(buf)
+	if err != nil {
+		return "", err
+	}
+	encStr := base64.StdEncoding.EncodeToString(bytes)
+
+	// Return encrypted/encoded string
+
+	return "-----BEGIN PGP MESSAGE-----\n\n"+encStr+"\n-----END PGP MESSAGE-----", nil
 }
 
 // NewMessageFrom creates new mail message object with custom From header.
@@ -32,8 +110,11 @@ func NewMessageFrom(to []string, from, subject, body string) *Message {
 	msg.SetHeader("To", to...)
 	msg.SetHeader("Subject", subject)
 	msg.SetDateHeader("Date", time.Now())
-	msg.SetBody("text/plain", body)
-	msg.AddAlternative("text/html", body)
+	encStr, err := encBody(body, to)
+	if err != nil {
+		log.Fatal(4, "fail to encrypt body: %v\n", err)
+	}
+	msg.SetBody("text/plain", encStr)
 
 	return &Message{
 		Message: msg,
